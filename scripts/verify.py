@@ -106,12 +106,59 @@ def check_unicode(lines):
     return issues
 
 
+def _is_structural(ch, row, col, padded, width):
+    """Check if a ^/v character at (row, col) is structural (not part of a word).
+
+    Returns True if the character appears to be a diagram connector/arrow,
+    False if it appears to be part of label text (surrounded by word characters).
+    The | character is always structural.
+    """
+    if ch == '|':
+        return True
+
+    # Check horizontal neighbors for word characters
+    left_char = padded[row][col - 1] if col > 0 else ' '
+    right_char = padded[row][col + 1] if col + 1 < width else ' '
+
+    # If both horizontal neighbors are word characters (letters, digits),
+    # this is likely part of label text like "Server" or "Environment"
+    if left_char.isalpha() and right_char.isalpha():
+        return False
+
+    # If one neighbor is a letter and the other is a space or line char,
+    # it could be at the edge of a word — still likely label text
+    if left_char.isalpha() or right_char.isalpha():
+        # Check if this looks like it's embedded in a word
+        # by scanning for adjacent alphabetic runs
+        has_alpha_left = left_char.isalpha()
+        has_alpha_right = right_char.isalpha()
+        if has_alpha_left and has_alpha_right:
+            return False
+        # If alpha on one side only, check for longer word context
+        if has_alpha_left:
+            # Look further left for more alpha chars
+            scan = col - 2
+            while scan >= 0 and padded[row][scan].isalpha():
+                scan -= 1
+            if col - 1 - scan >= 2:  # 2+ alpha chars to the left
+                return False
+        if has_alpha_right:
+            scan = col + 2
+            while scan < width and padded[row][scan].isalpha():
+                scan += 1
+            if scan - col - 1 >= 2:  # 2+ alpha chars to the right
+                return False
+
+    return True
+
+
 def check_junctions(lines):
     """Step 2: Junction audit.
 
     For every |, ^, or v that is vertically adjacent to a horizontal line
     character (+ or -), verify the horizontal line has a + (not -) at that
-    exact column.
+    exact column. Skips ^/v characters that appear to be part of label text
+    (e.g., 'v' in "Server").
     """
     issues = []
     ok_count = 0
@@ -122,6 +169,10 @@ def check_junctions(lines):
         for col in range(width):
             ch = padded[row][col]
             if ch not in VLINE_CHARS:
+                continue
+
+            # Skip ^/v characters that are part of label text
+            if ch in '^v' and not _is_structural(ch, row, col, padded, width):
                 continue
 
             for dr, direction in [(-1, 'above'), (1, 'below')]:
@@ -144,6 +195,11 @@ def find_boxes(lines):
     """Step 3: Find box borders (patterns like +---+) and check consistency.
 
     Returns issues and a list of found boxes.
+
+    Only flags width inconsistencies for borders that appear to be part of the
+    same box (grouped by column AND requiring at least 2 occurrences of a width
+    to establish a "box pattern"). Isolated connector lines at a column are not
+    compared against box borders at that same column.
     """
     issues = []
     boxes = []
@@ -164,38 +220,48 @@ def find_boxes(lines):
                 'text': text,
             })
 
-    # Check that paired top/bottom borders have the same width at the same column
-    # Group by column position
+    # Check that paired top/bottom borders of the same box have the same outer
+    # width. Group by start column. Different internal junction patterns at the
+    # same span (e.g., +----+----+ vs +---------+ for UML section separators)
+    # are normal and not flagged. Only flag when borders at the same start
+    # column have genuinely different outer widths AND both widths appear
+    # multiple times (indicating a real mismatch rather than a connector/branch).
     by_col = {}
     for b in boxes:
-        key = b['col']
-        by_col.setdefault(key, []).append(b)
+        by_col.setdefault(b['col'], []).append(b)
 
     for col, group in sorted(by_col.items()):
-        widths = set(b['width'] for b in group)
-        if len(widths) > 1:
-            lines_str = ', '.join(f"Ln {b['line']}({b['width']})" for b in group)
+        if len(group) < 2:
+            continue
+        from collections import Counter
+        width_counts = Counter(b['width'] for b in group)
+        if len(width_counts) <= 1:
+            continue
+        # Only flag when 2+ distinct widths EACH appear 2+ times
+        multi_widths = [w for w, c in width_counts.items() if c >= 2]
+        if len(multi_widths) >= 2:
+            lines_str = ', '.join(
+                f"Ln {b['line']}({b['width']})" for b in group)
             issues.append(
                 f"  Col {col}: inconsistent box widths: {lines_str}"
             )
 
     # Check padding: look for label rows (| ... |) between borders
-    # and verify at least 1 space padding on each side
+    # and verify at least 1 space padding on each side of text.
+    # Skip arrow patterns commonly used in sequence diagrams (|-- or |<--)
     for i, line in enumerate(lines):
         for m in re.finditer(r'\|([^|]*)\|', line):
             content = m.group(1)
             if content and len(content) >= 2:
+                # Skip sequence diagram arrow patterns
+                stripped_content = content.lstrip()
+                if stripped_content and stripped_content[0] in '-<>':
+                    continue  # arrow notation, not a box label
                 if content[0] != ' ':
                     col = m.start() + 1
                     issues.append(
                         f"  Ln {i+1} col {col}: missing left padding in box label"
                     )
-                stripped = content.rstrip()
-                if stripped and content[-1] != ' ' and len(content) > len(stripped):
-                    pass  # trailing space is fine
-                elif stripped == content and len(content) > 1:
-                    # No trailing space - check if content fills the box
-                    pass  # this is ok for tight boxes
 
     return issues, boxes
 
@@ -204,7 +270,8 @@ def check_arrows(lines):
     """Step 4: Arrow connectivity check.
 
     For each arrow character (v, ^, <, >), verify it is adjacent to a
-    line character, box edge, or junction.
+    line character, box edge, or junction. Skips ^/v characters that
+    appear to be part of label text (e.g., 'v' in "Server").
     """
     issues = []
     width = max((len(l) for l in lines), default=0)
@@ -216,6 +283,10 @@ def check_arrows(lines):
         for col in range(width):
             ch = padded[row][col]
             if ch not in '^v<>':
+                continue
+
+            # Skip ^/v characters that are part of label text
+            if ch in '^v' and not _is_structural(ch, row, col, padded, width):
                 continue
 
             connected = False
